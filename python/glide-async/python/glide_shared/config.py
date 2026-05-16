@@ -1,0 +1,1559 @@
+# Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum, IntEnum
+from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple, Union
+
+from glide_shared.cache import ClientSideCache
+from glide_shared.commands.core_options import PubSubMsg
+from glide_shared.exceptions import ConfigurationError
+from glide_shared.protobuf.connection_request_pb2 import (
+    CompressionBackend as ProtobufCompressionBackend,
+)
+from glide_shared.protobuf.connection_request_pb2 import (
+    CompressionConfig as ProtobufCompressionConfig,
+)
+from glide_shared.protobuf.connection_request_pb2 import (
+    ConnectionRequest,
+)
+from glide_shared.protobuf.connection_request_pb2 import (
+    NodeDiscoveryMode as ProtobufNodeDiscoveryMode,
+)
+from glide_shared.protobuf.connection_request_pb2 import (
+    ProtocolVersion as SentProtocolVersion,
+)
+from glide_shared.protobuf.connection_request_pb2 import ReadFrom as ProtobufReadFrom
+from glide_shared.protobuf.connection_request_pb2 import (
+    TlsMode,
+)
+
+
+class NodeAddress:
+    """
+    Represents the address and port of a node in the cluster.
+
+    Attributes:
+        host (str, optional): The server host. Defaults to "localhost".
+        port (int, optional): The server port. Defaults to 6379.
+    """
+
+    def __init__(self, host: str = "localhost", port: int = 6379):
+        self.host = host
+        self.port = port
+
+
+class AddressResolver(Protocol):
+    """
+    A callback protocol for resolving server addresses before connection.
+
+    When provided to a client configuration, this callback is invoked for each
+    configured address during connection establishment and during cluster topology
+    refreshes. The callback receives the configured host and port, and should return
+    the actual host and port to use for the connection.
+
+    Use cases:
+        - Custom DNS resolution for service discovery
+        - Address translation for proxy setups
+        - Dynamic endpoint resolution for cloud environments
+
+    Note:
+        The resolver must be thread-safe and should avoid blocking operations,
+        as it may be called from multiple threads during connection and topology refresh.
+        If the resolver raises an exception, the original address will be used as a fallback.
+
+    Example::
+
+        def my_resolver(host: str, port: int) -> Tuple[str, int]:
+            # Custom resolution logic
+            resolved_host = my_dns_resolver.resolve(host)
+            return (resolved_host, port)
+
+        config = GlideClientConfiguration(
+            addresses=[NodeAddress("my-service", 6379)],
+            address_resolver=my_resolver,
+        )
+    """
+
+    def __call__(self, host: str, port: int) -> Tuple[str, int]:
+        """
+        Resolve the given host and port to the actual connection address.
+
+        Args:
+            host (str): The configured host name or IP address.
+            port (int): The configured port number.
+
+        Returns:
+            Tuple[str, int]: A tuple of (resolved_host, resolved_port) to use for connection.
+        """
+        ...
+
+
+class ReadFrom(Enum):
+    """
+    Represents the client's read from strategy.
+    """
+
+    PRIMARY = ProtobufReadFrom.Primary
+    """
+    Always get from primary, in order to get the freshest data.
+    """
+    PREFER_REPLICA = ProtobufReadFrom.PreferReplica
+    """
+    Spread the requests between all replicas in a round robin manner.
+    If no replica is available, route the requests to the primary.
+    """
+    AZ_AFFINITY = ProtobufReadFrom.AZAffinity
+    """
+    Spread the read requests between replicas in the same client's AZ (Aviliablity zone) in a round robin manner,
+    falling back to other replicas or the primary if needed
+    """
+    AZ_AFFINITY_REPLICAS_AND_PRIMARY = ProtobufReadFrom.AZAffinityReplicasAndPrimary
+    """
+    Spread the read requests among nodes within the client's Availability Zone (AZ) in a round robin manner,
+    prioritizing local replicas, then the local primary, and falling back to any replica or the primary if needed.
+    """
+    ALL_NODES = ProtobufReadFrom.AllNodes
+    """
+    Spread the read requests between all nodes (primary and replicas) in a round robin manner.
+    """
+
+
+class ProtocolVersion(Enum):
+    """
+    Represents the communication protocol with the server.
+    """
+
+    RESP2 = SentProtocolVersion.RESP2
+    """
+    Communicate using RESP2.
+    """
+    RESP3 = SentProtocolVersion.RESP3
+    """
+    Communicate using RESP3.
+    """
+
+
+class CompressionBackend(Enum):
+    """
+    Represents the compression backend to use for automatic compression.
+    """
+
+    ZSTD = ProtobufCompressionBackend.ZSTD
+    """
+    Use zstd compression backend.
+    """
+    LZ4 = ProtobufCompressionBackend.LZ4
+    """
+    Use lz4 compression backend.
+    """
+
+
+class NodeDiscoveryMode(Enum):
+    """
+    Controls how the client discovers node roles and topology in standalone mode.
+    """
+
+    STANDARD = ProtobufNodeDiscoveryMode.Standard
+    """
+    Default: verify node roles via INFO REPLICATION, use only provided addresses.
+    The client connects to all provided addresses and identifies which is the primary.
+    """
+    STATIC = ProtobufNodeDiscoveryMode.Static
+    """
+    Skip role detection entirely. Trust provided addresses as-is; first address is primary.
+    Use when connecting through a proxy (e.g., Envoy) or when the topology is known and static.
+
+    Note: Do not set ``client_name`` when using this mode with a proxy.
+    """
+    DISCOVER_ALL = ProtobufNodeDiscoveryMode.DiscoverAll
+    """
+    Discover full topology (primary + all replicas) from any starting node.
+    Provide any single node address and the client will find and connect to all other nodes.
+    """
+
+
+def _get_min_compressed_size() -> int:
+    """
+    Get the minimum compressed size from the Rust core.
+    This ensures Python validation stays in sync with Rust implementation.
+    """
+    try:
+        # Try async module first
+        from glide import get_min_compressed_size
+
+        return get_min_compressed_size()
+    except ImportError:
+        pass
+
+    try:
+        # Try sync module
+        from glide_sync import get_min_compressed_size
+
+        return get_min_compressed_size()
+    except ImportError:
+        pass
+
+    # If neither module is available, fail fast
+    raise ImportError(
+        "Cannot import get_min_compressed_size from either 'glide' or 'glide_sync'. "
+        "Ensure the native module is built and available."
+    )
+
+
+# Lazy cache for minimum compression size to avoid circular import issues
+_MIN_COMPRESSED_SIZE_CACHE: Optional[int] = None
+
+
+def _get_min_compressed_size_cached() -> int:
+    """
+    Get the minimum compressed size with caching.
+    Uses lazy initialization to avoid circular import issues.
+    """
+    global _MIN_COMPRESSED_SIZE_CACHE
+    if _MIN_COMPRESSED_SIZE_CACHE is None:
+        _MIN_COMPRESSED_SIZE_CACHE = _get_min_compressed_size()
+    return _MIN_COMPRESSED_SIZE_CACHE
+
+
+@dataclass
+class CompressionConfiguration:
+    """
+    Represents the compression configuration for automatic compression of values.
+
+    WARNING: This feature is experimental and not recommended for production use.
+
+    Compression is NOT compatible with commands that manipulate string data on the server side:
+    - APPEND, GETRANGE, SETRANGE, STRLEN, LCS
+    - INCR, INCRBY, INCRBYFLOAT, DECR, DECRBY
+    - GETBIT, SETBIT, BITCOUNT, BITPOS, BITFIELD, BITFIELD_RO, BITOP
+
+    Using these commands with compressed values will result in incorrect behavior or errors.
+
+    Attributes:
+        enabled (bool): Whether compression is enabled. Defaults to False.
+        backend (CompressionBackend): The compression backend to use. Defaults to CompressionBackend.ZSTD.
+        compression_level (Optional[int]): The compression level to use. If not set, the backend's default level will be used.
+            Valid ranges are backend-specific and validated by the Rust core.
+            ZSTD default is 3
+            LZ4 default is 0
+        min_compression_size (int): The minimum size in bytes for values to be compressed. Values smaller than this will not be compressed. Defaults to 64 bytes.
+        max_decompressed_size (Optional[int]): Maximum allowed size in bytes for decompressed data.
+            This limit prevents decompression bombs (maliciously crafted compressed data that expands to huge sizes).
+            If not set, defaults to 512MB (matching Valkey's proto-max-bulk-len).
+    """
+
+    enabled: bool = False
+    backend: CompressionBackend = CompressionBackend.ZSTD
+    compression_level: Optional[int] = None
+    min_compression_size: int = 64
+    max_decompressed_size: Optional[int] = None  # Use Rust default (512MB)
+
+    def __post_init__(self) -> None:
+        """Validate compression configuration parameters."""
+        self._validate_configuration()
+
+    def _validate_configuration(self) -> None:
+        """
+        Validates the compression configuration parameters.
+
+        Raises:
+            ConfigurationError: If any configuration parameter is invalid.
+        """
+        min_size = _get_min_compressed_size_cached()
+        if self.min_compression_size < min_size:
+            raise ConfigurationError(
+                f"min_compression_size should be at least {min_size} bytes"
+            )
+
+        if self.max_decompressed_size is not None and self.max_decompressed_size <= 0:
+            raise ConfigurationError("max_decompressed_size must be positive if set")
+
+        # Note: compression_level validation is performed by the Rust core,
+        # which uses the actual compression library's valid ranges.
+        # This ensures the validation stays in sync with library updates.
+
+    def _to_protobuf(self) -> ProtobufCompressionConfig:
+        """
+        Converts the compression configuration to protobuf format.
+
+        Returns:
+            ProtobufCompressionConfig: The protobuf compression configuration.
+
+        Raises:
+            ConfigurationError: If any configuration parameter is invalid.
+        """
+        # Validate configuration before converting to protobuf
+        # This protects against modifications made after __post_init__
+        self._validate_configuration()
+
+        config = ProtobufCompressionConfig()
+        config.enabled = self.enabled
+        config.backend = self.backend.value
+        config.min_compression_size = self.min_compression_size
+
+        if self.compression_level is not None:
+            config.compression_level = self.compression_level
+
+        # Handle max_decompressed_size:
+        # - None = don't set field, let Rust use its default (512MB)
+        # - int > 0 = use that value
+        if self.max_decompressed_size is not None:
+            config.max_decompressed_size = self.max_decompressed_size
+
+        return config
+
+
+class BackoffStrategy:
+    """
+    Represents the strategy used to determine how and when to reconnect, in case of connection failures.
+    The time between attempts grows exponentially, to the formula rand(0 .. factor * (exponentBase ^ N)), where N
+    is the number of failed attempts, and rand(...) applies a jitter of up to jitter_percent% to introduce randomness and reduce retry storms.
+    Once the maximum value is reached, that will remain the time between retry attempts until a reconnect attempt is
+    successful.
+    The client will attempt to reconnect indefinitely.
+
+    Attributes:
+        num_of_retries (int): Number of retry attempts that the client should perform when disconnected from the server,
+            where the time between retries increases. Once the retries have reached the maximum value, the time between
+            retries will remain constant until a reconnect attempt is succesful.
+        factor (int): The multiplier that will be applied to the waiting time between each retry.
+            This value is specified in milliseconds.
+        exponent_base (int): The exponent base configured for the strategy.
+        jitter_percent (Optional[int]): The Jitter percent on the calculated duration. If not set, a default value will be used.
+    """
+
+    def __init__(
+        self,
+        num_of_retries: int,
+        factor: int,
+        exponent_base: int,
+        jitter_percent: Optional[int] = None,
+    ):
+        self.num_of_retries = num_of_retries
+        self.factor = factor
+        self.exponent_base = exponent_base
+        self.jitter_percent = jitter_percent
+
+
+class ServiceType(Enum):
+    """
+    Represents the types of AWS services that can be used for IAM authentication.
+    """
+
+    ELASTICACHE = 0
+    """Amazon ElastiCache service."""
+    MEMORYDB = 1
+    """Amazon MemoryDB service."""
+
+
+class IamAuthConfig:
+    """
+    Configuration settings for IAM authentication.
+
+    Attributes:
+        cluster_name (str): The name of the ElastiCache/MemoryDB cluster.
+        service (ServiceType): The type of service being used (ElastiCache or MemoryDB).
+        region (str): The AWS region where the ElastiCache/MemoryDB cluster is located.
+        refresh_interval_seconds (Optional[int]): Optional refresh interval in seconds for renewing IAM authentication tokens.
+            If not provided, the core will use a default value of 300 seconds (5 min).
+    """
+
+    def __init__(
+        self,
+        cluster_name: str,
+        service: ServiceType,
+        region: str,
+        refresh_interval_seconds: Optional[int] = None,
+    ):
+        self.cluster_name = cluster_name
+        self.service = service
+        self.region = region
+        self.refresh_interval_seconds = refresh_interval_seconds
+
+
+class ServerCredentials:
+    """
+    Represents the credentials for connecting to a server.
+
+    Exactly one of the following authentication modes must be provided:
+        - Password-based authentication: Use password (and optionally username)
+        - IAM authentication: Use username (required) and iam_config
+
+    These modes are mutually exclusive - you cannot use both simultaneously.
+
+    Attributes:
+        password (Optional[str]): The password that will be used for authenticating connections to the servers.
+            Mutually exclusive with iam_config. Either password or iam_config must be provided.
+        username (Optional[str]): The username that will be used for authenticating connections to the servers.
+            If not supplied for password-based authentication, "default" will be used.
+            Required for IAM authentication.
+        iam_config (Optional[IamAuthConfig]): IAM authentication configuration. Mutually exclusive with password.
+            Either password or iam_config must be provided.
+            The client will automatically generate and refresh the authentication token based on the provided configuration.
+    """
+
+    def __init__(
+        self,
+        password: Optional[str] = None,
+        username: Optional[str] = None,
+        iam_config: Optional[IamAuthConfig] = None,
+    ):
+        # Validate mutual exclusivity
+        if password is not None and iam_config is not None:
+            raise ConfigurationError(
+                "password and iam_config are mutually exclusive. Use either password-based or IAM authentication, not both."
+            )
+
+        # Validate IAM requires username
+        if iam_config is not None and not username:
+            raise ConfigurationError("username is required for IAM authentication.")
+
+        # At least one authentication method must be provided
+        if password is None and iam_config is None:
+            raise ConfigurationError(
+                "Either password or iam_config must be provided for authentication."
+            )
+
+        self.password = password
+        self.username = username
+        self.iam_config = iam_config
+
+    def is_iam_auth(self) -> bool:
+        """Returns True if this credential is configured for IAM authentication."""
+        return self.iam_config is not None
+
+
+class PeriodicChecksManualInterval:
+    """
+    Represents a manually configured interval for periodic checks.
+
+    Attributes:
+        duration_in_sec (int): The duration in seconds for the interval between periodic checks.
+    """
+
+    def __init__(self, duration_in_sec: int) -> None:
+        self.duration_in_sec = duration_in_sec
+
+
+class PeriodicChecksStatus(Enum):
+    """
+    Represents the cluster's periodic checks status.
+    To configure specific interval, see PeriodicChecksManualInterval.
+    """
+
+    ENABLED_DEFAULT_CONFIGS = 0
+    """
+    Enables the periodic checks with the default configurations.
+    """
+    DISABLED = 1
+    """
+    Disables the periodic checks.
+    """
+
+
+class TlsAdvancedConfiguration:
+    """
+    Represents advanced TLS configuration settings.
+
+    Attributes:
+        use_insecure_tls (Optional[bool]): Whether to bypass TLS certificate verification.
+
+            - When set to True, the client skips certificate validation.
+              This is useful when connecting to servers or clusters using self-signed certificates,
+              or when DNS entries (e.g., CNAMEs) don't match certificate hostnames.
+
+            - This setting is typically used in development or testing environments. **It is
+              strongly discouraged in production**, as it introduces security risks such as man-in-the-middle attacks.
+
+            - Only valid if TLS is already enabled in the base client configuration.
+              Enabling it without TLS will result in a `ConfigurationError`.
+
+            - Default: False (verification is enforced).
+
+        root_pem_cacerts (Optional[bytes]): Custom root certificate data for TLS connections in PEM format.
+
+            - When provided, these certificates will be used instead of the system's default trust store.
+              This is useful for connecting to servers with self-signed certificates or corporate
+              certificate authorities.
+
+            - If set to an empty bytes object (non-None but length 0), a `ConfigurationError` will be raised.
+
+            - If None (default), the system's default certificate trust store will be used (platform verifier).
+
+            - The certificate data should be in PEM format as a bytes object.
+
+            - Multiple certificates can be provided by concatenating them in PEM format.
+
+            Example usage::
+
+                # Load from file
+                with open('/path/to/ca-cert.pem', 'rb') as f:
+                    cert_data = f.read()
+                tls_config = TlsAdvancedConfiguration(root_pem_cacerts=cert_data)
+
+                # Or provide directly
+                cert_data = b"-----BEGIN CERTIFICATE-----\\n...\\n-----END CERTIFICATE-----"
+                tls_config = TlsAdvancedConfiguration(root_pem_cacerts=cert_data)
+
+        client_cert_pem (Optional[bytes]): Client certificate data for mutual TLS authentication in PEM format.
+
+            - When provided along with client_key_pem, enables mutual TLS (mTLS) authentication
+              so that the client presents its certificate to the server.
+
+            - This is to be used when the server requires client certificate authentication.
+
+            - If set to an empty bytes object (non-None but length 0), a `ConfigurationError` will be raised.
+
+            - If None (default), no client certificate will be presented.
+
+            - The certificate data should be in PEM format as a bytes object.
+
+            - Must be used together with client_key_pem.
+
+            Example usage::
+
+                # Load from file
+                with open('/path/to/client-cert.pem', 'rb') as f:
+                    client_cert = f.read()
+                with open('/path/to/client-key.pem', 'rb') as f:
+                    client_key = f.read()
+                tls_config = TlsAdvancedConfiguration(
+                    client_cert_pem=client_cert,
+                    client_key_pem=client_key
+                )
+
+        client_key_pem (Optional[bytes]): Client private key data for mutual TLS authentication in PEM format.
+
+            - When provided along with client_cert_pem, enables mutual TLS (mTLS) authentication.
+
+            - This private key corresponds to the certificate provided in client_cert_pem.
+
+            - If set to an empty bytes object (non-None but length 0), a `ConfigurationError` will be raised.
+
+            - If None (default), no client key will be used.
+
+            - The key data should be in PEM format as a bytes object.
+
+            - Must be used together with client_cert_pem.
+    """
+
+    def __init__(
+        self,
+        use_insecure_tls: Optional[bool] = None,
+        root_pem_cacerts: Optional[bytes] = None,
+        client_cert_pem: Optional[bytes] = None,
+        client_key_pem: Optional[bytes] = None,
+    ):
+        self.use_insecure_tls = use_insecure_tls
+        self.root_pem_cacerts = root_pem_cacerts
+        self.client_cert_pem = client_cert_pem
+        self.client_key_pem = client_key_pem
+
+
+class AdvancedBaseClientConfiguration:
+    """
+    Represents the advanced configuration settings for a base Glide client.
+
+    Attributes:
+        connection_timeout (Optional[int]): The duration in milliseconds to wait for a TCP/TLS connection to complete.
+            This applies both during initial client creation and any reconnection that may occur during request processing.
+            **Note**: A high connection timeout may lead to prolonged blocking of the entire command pipeline.
+            If not explicitly set, a default value of 2000 milliseconds will be used.
+        tls_config (Optional[TlsAdvancedConfiguration]): The advanced TLS configuration settings.
+            This allows for more granular control of TLS behavior, such as enabling an insecure mode
+            that bypasses certificate validation.
+        tcp_nodelay (Optional[bool]): Controls TCP_NODELAY socket option (Nagle's algorithm).
+            When True, disables Nagle's algorithm for lower latency by sending packets immediately without buffering.
+            When False, enables Nagle's algorithm to reduce network overhead by buffering small packets.
+            If not explicitly set, defaults to True.
+        pubsub_reconciliation_interval (Optional[int]): The interval in milliseconds between PubSub subscription
+            reconciliation attempts. The reconciliation process ensures that the client's desired subscriptions
+            match the actual subscriptions on the server.
+    """
+
+    def __init__(
+        self,
+        connection_timeout: Optional[int] = None,
+        tls_config: Optional[TlsAdvancedConfiguration] = None,
+        tcp_nodelay: Optional[bool] = None,
+        pubsub_reconciliation_interval: Optional[int] = None,
+    ):
+        if (
+            pubsub_reconciliation_interval is not None
+            and pubsub_reconciliation_interval <= 0
+        ):
+            raise ValueError(
+                f"pubsub_reconciliation_interval must be positive, got: {pubsub_reconciliation_interval}"
+            )
+        self.connection_timeout = connection_timeout
+        self.tls_config = tls_config
+        self.tcp_nodelay = tcp_nodelay
+        self.pubsub_reconciliation_interval = pubsub_reconciliation_interval
+
+    def _create_a_protobuf_conn_request(
+        self, request: ConnectionRequest
+    ) -> ConnectionRequest:
+        if self.connection_timeout is not None:
+            request.connection_timeout = self.connection_timeout
+
+        if self.tcp_nodelay is not None:
+            request.tcp_nodelay = self.tcp_nodelay
+
+        if self.pubsub_reconciliation_interval is not None:
+            request.pubsub_reconciliation_interval_ms = (
+                self.pubsub_reconciliation_interval
+            )
+
+        if self.tls_config is not None:
+            self._apply_tls_config(request, self.tls_config)
+
+        return request
+
+    def _apply_tls_config(
+        self, request: ConnectionRequest, tls_config: TlsAdvancedConfiguration
+    ) -> None:
+        # Validate and handle insecure TLS
+        if tls_config.use_insecure_tls:
+            # Validate that TLS is enabled before allowing insecure mode
+            if request.tls_mode == TlsMode.NoTls:
+                raise ConfigurationError(
+                    "use_insecure_tls cannot be enabled when use_tls is disabled."
+                )
+
+            # Override the default SecureTls mode to InsecureTls when user explicitly requests it
+            request.tls_mode = TlsMode.InsecureTls
+
+        # Handle root certificates
+        root_certs = tls_config.root_pem_cacerts
+        if root_certs is not None:
+            if len(root_certs) == 0:
+                raise ConfigurationError(
+                    "root_pem_cacerts cannot be an empty bytes object; use None to use platform verifier"
+                )
+            request.root_certs.append(root_certs)
+
+        # Handle client certificate for mutual TLS
+        client_cert = tls_config.client_cert_pem
+        if client_cert is not None:
+            if len(client_cert) == 0:
+                raise ConfigurationError(
+                    "client_cert_pem cannot be an empty bytes object; use None if not providing client certificate"
+                )
+            request.client_cert = client_cert
+
+        # Handle client key for mutual TLS
+        client_key = tls_config.client_key_pem
+        if client_key is not None:
+            if len(client_key) == 0:
+                raise ConfigurationError(
+                    "client_key_pem cannot be an empty bytes object; use None if not providing client key"
+                )
+            request.client_key = client_key
+
+        # Ensure client cert and client key are both provided or not provided
+        self._validate_client_auth_tls()
+
+    def _validate_client_auth_tls(self):
+        if self.tls_config.client_cert_pem and not self.tls_config.client_key_pem:
+            raise ConfigurationError(
+                "client_cert_pem is provided but client_key_pem not provided. mTLS requires both",
+            )
+        if self.tls_config.client_key_pem and not self.tls_config.client_cert_pem:
+            raise ConfigurationError(
+                "client_key_pem is provided but client_cert_pem not provided. mTLS requires both",
+            )
+
+
+class BaseClientConfiguration:
+    """
+    Represents the configuration settings for a Glide client.
+
+    Attributes:
+        addresses (List[NodeAddress]): DNS Addresses and ports of known nodes in the cluster.
+            If the server is in cluster mode the list can be partial, as the client will attempt to map out
+            the cluster and find all nodes.
+            If the server is in standalone mode, only nodes whose addresses were provided will be used by the
+            client.
+            For example::
+
+                [
+                    NodeAddress("sample-address-0001.use1.cache.amazonaws.com", 6379),
+                    NodeAddress("sample-address-0002.use1.cache.amazonaws.com", 6379)
+                ]
+
+        use_tls (bool): True if communication with the cluster should use Transport Level Security.
+            Should match the TLS configuration of the server/cluster, otherwise the connection attempt will fail.
+            For advanced tls configuration, please use `AdvancedBaseClientConfiguration`.
+        credentials (ServerCredentials): Credentials for authentication process.
+            If none are set, the client will not authenticate itself with the server.
+        read_from (ReadFrom): If not set, `PRIMARY` will be used.
+        request_timeout (Optional[int]): The duration in milliseconds that the client should wait for a request to
+            complete.
+            This duration encompasses sending the request, awaiting for a response from the server, and any required
+            reconnection or retries.
+            If the specified timeout is exceeded for a pending request, it will result in a timeout error. If not
+            explicitly set, a default value of 250 milliseconds will be used.
+        reconnect_strategy (Optional[BackoffStrategy]): Strategy used to determine how and when to reconnect, in case of
+            connection failures.
+            If not set, a default backoff strategy will be used.
+        database_id (Optional[int]): Index of the logical database to connect to.
+            Must be a non-negative integer.If not set, the client will connect to database 0.
+        client_name (Optional[str]): Client name to be used for the client. Will be used with CLIENT SETNAME command
+            during connection establishment.
+        protocol (ProtocolVersion): Serialization protocol to be used. If not set, `RESP3` will be used.
+        inflight_requests_limit (Optional[int]): The maximum number of concurrent requests allowed to be in-flight
+            (sent but not yet completed).
+            This limit is used to control the memory usage and prevent the client from overwhelming the server or getting
+            stuck in case of a queue backlog.
+            If not set, a default value will be used.
+        client_az (Optional[str]): Availability Zone of the client.
+            If ReadFrom strategy is AZAffinity, this setting ensures that readonly commands are directed to replicas
+            within the specified AZ if exits.
+            If ReadFrom strategy is AZAffinityReplicasAndPrimary, this setting ensures that readonly commands are directed
+            to nodes (first replicas then primary) within the specified AZ if they exist.
+        advanced_config (Optional[AdvancedBaseClientConfiguration]): Advanced configuration settings for the client.
+
+        lazy_connect (Optional[bool]): Enables lazy connection mode, where physical connections to the server(s)
+            are deferred until the first command is sent. This can reduce startup latency and allow for client
+            creation in disconnected environments.
+
+            When set to `True`, the client will not attempt to connect to the specified nodes during
+            initialization. Instead, connections will be established only when a command is actually executed.
+
+            Note that the first command executed with lazy connections may experience additional latency
+            as it needs to establish the connection first. During this initial connection, the standard
+            request timeout does not apply yet - instead, the connection establishment is governed by
+            `AdvancedBaseClientConfiguration.connection_timeout`. The request timeout (`request_timeout`)
+            only begins counting after the connection has been successfully established. This behavior
+            can effectively increase the total time needed for the first command to complete.
+
+            This setting applies to both standalone and cluster modes. Note that if an operation is
+            attempted and connection fails (e.g., unreachable nodes), errors will surface at that point.
+
+            If not set, connections are established immediately during client creation (equivalent to `False`).
+
+        compression (Optional[CompressionConfiguration]): Configuration for automatic compression of values.
+            ⚠️ WARNING: This feature is experimental and not recommended for production use.
+            When enabled, the client will automatically compress values for set-type commands and decompress
+            values for get-type commands. This can reduce bandwidth usage and storage requirements.
+            Compression is NOT compatible with server-side string manipulation commands (APPEND, GETRANGE, etc.).
+            If not set, compression is disabled.
+
+        client_side_cache (Optional[ClientSideCache]): Configuration for client-side caching.
+            See `ClientSideCache` for caching behavior details, supported commands, and expiration semantics.
+
+            In order for 2 clients to share the same cache, they must be
+            created with the same ``ClientSideCache`` instance.
+
+            - Clients with different ``ClientSideCache`` instances will have separate caches,
+              even if the configurations are identical.
+            - Clients using different DBs cannot share the same cache.
+            - Clients using different ACL users cannot share the same cache.
+
+        address_resolver (Optional[AddressResolver]): Optional callback for resolving server addresses
+            before connection. When provided, this callback will be invoked for each configured address
+            during connection establishment and during cluster topology refreshes.
+            The callback receives the configured host and port, and should return the actual
+            host and port to use for the connection.
+
+            This is useful for:
+                - Custom DNS resolution for service discovery
+                - Address translation for proxy setups
+                - Dynamic endpoint resolution for cloud environments
+
+            If not set, addresses are used as configured without modification.
+
+            Example::
+
+                def my_resolver(host: str, port: int) -> Tuple[str, int]:
+                    resolved_host = my_dns_resolver.resolve(host)
+                    return (resolved_host, port)
+
+                config = GlideClientConfiguration(
+                    addresses=[NodeAddress("my-service", 6379)],
+                    address_resolver=my_resolver,
+                )
+    """
+
+    def __init__(
+        self,
+        addresses: List[NodeAddress],
+        use_tls: bool = False,
+        credentials: Optional[ServerCredentials] = None,
+        read_from: ReadFrom = ReadFrom.PRIMARY,
+        request_timeout: Optional[int] = None,
+        reconnect_strategy: Optional[BackoffStrategy] = None,
+        database_id: Optional[int] = None,
+        client_name: Optional[str] = None,
+        protocol: ProtocolVersion = ProtocolVersion.RESP3,
+        inflight_requests_limit: Optional[int] = None,
+        client_az: Optional[str] = None,
+        advanced_config: Optional[AdvancedBaseClientConfiguration] = None,
+        lazy_connect: Optional[bool] = None,
+        compression: Optional[CompressionConfiguration] = None,
+        client_side_cache: Optional[ClientSideCache] = None,
+        address_resolver: Optional[Callable[[str, int], Tuple[str, int]]] = None,
+    ):
+        self.addresses = addresses
+        self.use_tls = use_tls
+        self.credentials = credentials
+        self.read_from = read_from
+        self.request_timeout = request_timeout
+        self.reconnect_strategy = reconnect_strategy
+        self.database_id = database_id
+        self.client_name = client_name
+        self.protocol = protocol
+        self.inflight_requests_limit = inflight_requests_limit
+        self.client_az = client_az
+        self.advanced_config = advanced_config
+        self.lazy_connect = lazy_connect
+        self.compression = compression
+        self.client_side_cache = client_side_cache
+        self.address_resolver = address_resolver
+
+        if read_from == ReadFrom.AZ_AFFINITY and not client_az:
+            raise ValueError(
+                "client_az must be set when read_from is set to AZ_AFFINITY"
+            )
+
+        if read_from == ReadFrom.AZ_AFFINITY_REPLICAS_AND_PRIMARY and not client_az:
+            raise ValueError(
+                "client_az must be set when read_from is set to AZ_AFFINITY_REPLICAS_AND_PRIMARY"
+            )
+
+    def _set_addresses_in_request(self, request: ConnectionRequest) -> None:
+        """Set addresses in the protobuf request."""
+        for address in self.addresses:
+            address_info = request.addresses.add()
+            address_info.host = address.host
+            address_info.port = address.port
+
+    def _set_reconnect_strategy_in_request(self, request: ConnectionRequest) -> None:
+        """Set reconnect strategy in the protobuf request."""
+        if not self.reconnect_strategy:
+            return
+
+        request.connection_retry_strategy.number_of_retries = (
+            self.reconnect_strategy.num_of_retries
+        )
+        request.connection_retry_strategy.factor = self.reconnect_strategy.factor
+        request.connection_retry_strategy.exponent_base = (
+            self.reconnect_strategy.exponent_base
+        )
+        if self.reconnect_strategy.jitter_percent is not None:
+            request.connection_retry_strategy.jitter_percent = (
+                self.reconnect_strategy.jitter_percent
+            )
+
+    def _set_credentials_in_request(self, request: ConnectionRequest) -> None:
+        """Set credentials in the protobuf request."""
+        if not self.credentials:
+            return
+
+        if self.credentials.username:
+            request.authentication_info.username = self.credentials.username
+
+        if self.credentials.password:
+            request.authentication_info.password = self.credentials.password
+
+        # Set IAM credentials if present
+        if self.credentials.iam_config:
+            iam_config = self.credentials.iam_config
+            request.authentication_info.iam_credentials.cluster_name = (
+                iam_config.cluster_name
+            )
+            request.authentication_info.iam_credentials.region = iam_config.region
+
+            # Map ServiceType enum to protobuf ServiceType
+            if iam_config.service == ServiceType.ELASTICACHE:
+                from glide_shared.protobuf.connection_request_pb2 import (
+                    ServiceType as ProtobufServiceType,
+                )
+
+                request.authentication_info.iam_credentials.service_type = (
+                    ProtobufServiceType.ELASTICACHE
+                )
+            elif iam_config.service == ServiceType.MEMORYDB:
+                from glide_shared.protobuf.connection_request_pb2 import (
+                    ServiceType as ProtobufServiceType,
+                )
+
+                request.authentication_info.iam_credentials.service_type = (
+                    ProtobufServiceType.MEMORYDB
+                )
+
+            # Set optional refresh interval
+            if iam_config.refresh_interval_seconds is not None:
+                request.authentication_info.iam_credentials.refresh_interval_seconds = (
+                    iam_config.refresh_interval_seconds
+                )
+
+    def _set_client_side_cache_in_request(self, request: ConnectionRequest) -> None:
+        """Set client-side cache in the protobuf request."""
+        if not self.client_side_cache:
+            return
+
+        request.client_side_cache.cache_id = self.client_side_cache.cache_id
+        request.client_side_cache.max_cache_kb = self.client_side_cache.max_cache_kb
+
+        request.client_side_cache.entry_ttl_ms = self.client_side_cache.entry_ttl_ms
+        request.client_side_cache.enable_metrics = self.client_side_cache.enable_metrics
+        if self.client_side_cache.eviction_policy:
+            request.client_side_cache.eviction_policy = (
+                self.client_side_cache.eviction_policy.value
+            )
+
+    def _create_a_protobuf_conn_request(
+        self, cluster_mode: bool = False
+    ) -> ConnectionRequest:
+        """
+        Generates a Protobuf ConnectionRequest using the values from this ClientConfiguration.
+
+        Args:
+            cluster_mode (bool, optional): The cluster mode of the client. Defaults to False.
+
+        Returns:
+            ConnectionRequest: Protobuf ConnectionRequest.
+        """
+        request = ConnectionRequest()
+
+        # Set basic configuration
+        self._set_addresses_in_request(request)
+        request.tls_mode = TlsMode.SecureTls if self.use_tls else TlsMode.NoTls
+        request.read_from = self.read_from.value
+        request.cluster_mode_enabled = cluster_mode
+        request.protocol = self.protocol.value
+
+        # Set optional configuration
+        if self.request_timeout:
+            request.request_timeout = self.request_timeout
+
+        self._set_reconnect_strategy_in_request(request)
+        self._set_credentials_in_request(request)
+        self._set_client_side_cache_in_request(request)
+
+        if self.client_name:
+            request.client_name = self.client_name
+        if self.inflight_requests_limit:
+            request.inflight_requests_limit = self.inflight_requests_limit
+        if self.client_az:
+            request.client_az = self.client_az
+        if self.database_id is not None:
+            request.database_id = self.database_id
+        if self.advanced_config:
+            self.advanced_config._create_a_protobuf_conn_request(request)
+        if self.lazy_connect is not None:
+            request.lazy_connect = self.lazy_connect
+        if self.compression is not None:
+            request.compression_config.CopyFrom(self.compression._to_protobuf())
+        return request
+
+    def _get_pubsub_callback_and_context(
+        self,
+    ) -> Tuple[Optional[Callable[[PubSubMsg, Any], None]], Any]:
+        return None, None
+
+
+class AdvancedGlideClientConfiguration(AdvancedBaseClientConfiguration):
+    """
+    Represents the advanced configuration settings for a Standalone Glide client.
+    """
+
+    def __init__(
+        self,
+        connection_timeout: Optional[int] = None,
+        tls_config: Optional[TlsAdvancedConfiguration] = None,
+        tcp_nodelay: Optional[bool] = None,
+        pubsub_reconciliation_interval: Optional[int] = None,
+    ):
+
+        super().__init__(
+            connection_timeout, tls_config, tcp_nodelay, pubsub_reconciliation_interval
+        )
+
+
+class GlideClientConfiguration(BaseClientConfiguration):
+    """
+    Represents the configuration settings for a Standalone Glide client.
+
+    Attributes:
+        addresses (List[NodeAddress]): DNS Addresses and ports of known nodes in the cluster.
+            Only nodes whose addresses were provided will be used by the client.
+            For example::
+
+                [
+                    NodeAddress("sample-address-0001.use1.cache.amazonaws.com", 6379),
+                    NodeAddress("sample-address-0002.use1.cache.amazonaws.com", 6379)
+                ]
+
+        use_tls (bool): True if communication with the cluster should use Transport Level Security.
+                Please use `AdvancedGlideClusterClientConfiguration`.
+        credentials (ServerCredentials): Credentials for authentication process.
+                If none are set, the client will not authenticate itself with the server.
+        read_from (ReadFrom): If not set, `PRIMARY` will be used.
+        request_timeout (Optional[int]):  The duration in milliseconds that the client should wait for a request to complete.
+                This duration encompasses sending the request, awaiting for a response from the server, and any required
+                reconnection or retries.
+                If the specified timeout is exceeded for a pending request, it will result in a timeout error.
+                If not explicitly set, a default value of 250 milliseconds will be used.
+        reconnect_strategy (Optional[BackoffStrategy]): Strategy used to determine how and when to reconnect, in case of
+            connection failures.
+            If not set, a default backoff strategy will be used.
+        database_id (Optional[int]): Index of the logical database to connect to.
+        client_name (Optional[str]): Client name to be used for the client. Will be used with CLIENT SETNAME command during
+            connection establishment.
+        protocol (ProtocolVersion): The version of the RESP protocol to communicate with the server.
+        pubsub_subscriptions (Optional[GlideClientConfiguration.PubSubSubscriptions]): Pubsub subscriptions to be used for the
+                client.
+                Will be applied via SUBSCRIBE/PSUBSCRIBE commands during connection establishment.
+        inflight_requests_limit (Optional[int]): The maximum number of concurrent requests allowed to be in-flight
+            (sent but not yet completed).
+            This limit is used to control the memory usage and prevent the client from overwhelming the server or getting
+            stuck in case of a queue backlog.
+            If not set, a default value will be used.
+        client_az (Optional[str]): Availability Zone of the client.
+            If ReadFrom strategy is AZAffinity, this setting ensures that readonly commands are directed to replicas within
+            the specified AZ if exits.
+            If ReadFrom strategy is AZAffinityReplicasAndPrimary, this setting ensures that readonly commands are directed to
+            nodes (first replicas then primary) within the specified AZ if they exist.
+        advanced_config (Optional[AdvancedGlideClientConfiguration]): Advanced configuration settings for the client,
+            see `AdvancedGlideClientConfiguration`.
+        compression (Optional[CompressionConfiguration]): Configuration for automatic compression of values.
+            When enabled, the client will automatically compress values for set-type commands and decompress
+            values for get-type commands. This can reduce bandwidth usage and storage requirements.
+            If not set, compression is disabled.
+        read_only (bool): When True, enables read-only mode for the standalone client.
+            In read-only mode:
+            - The client skips primary node detection (INFO REPLICATION command)
+            - Write commands are blocked and will return an error
+            - All connected nodes are treated as valid read targets
+            - If no ReadFrom strategy is specified, defaults to PreferReplica
+            This is useful for connecting to replica-only deployments or when you want to
+            prevent accidental write operations.
+            Note: read_only mode is not compatible with AZAffinity or AZAffinityReplicasAndPrimary
+            read strategies.
+            Defaults to False.
+        client_side_cache (Optional[ClientSideCache]): Configuration for client-side caching.
+            See `ClientSideCache` for caching behavior details, supported commands, and expiration semantics.
+
+            In order for 2 clients to share the same cache, they must be
+            created with the same ``ClientSideCache`` instance.
+
+            - Clients with different ``ClientSideCache`` instances will have separate caches,
+              even if the configurations are identical.
+            - Clients using different DBs cannot share the same cache.
+            - Clients using different ACL users cannot share the same cache.
+        node_discovery_mode (NodeDiscoveryMode): Controls how the client discovers node roles
+            and topology in standalone mode. If not set, `STANDARD` will be used.
+    """
+
+    class PubSubChannelModes(IntEnum):
+        """
+        Describes pubsub subsciption modes.
+        See [valkey.io](https://valkey.io/docs/topics/pubsub/) for more details
+        """
+
+        Exact = 0
+        """ Use exact channel names """
+        Pattern = 1
+        """ Use channel name patterns """
+
+    @dataclass
+    class PubSubSubscriptions:
+        """Describes pubsub configuration for standalone mode client.
+
+        Attributes:
+            channels_and_patterns (Dict[GlideClientConfiguration.PubSubChannelModes, Set[str]]):
+                Channels and patterns by modes.
+            callback (Optional[Callable[[PubSubMsg, Any], None]]):
+                Optional callback to accept the incomming messages.
+            context (Any):
+                Arbitrary context to pass to the callback.
+        """
+
+        channels_and_patterns: Dict[
+            GlideClientConfiguration.PubSubChannelModes, Set[str]
+        ]
+        callback: Optional[Callable[[PubSubMsg, Any], None]]
+        context: Any
+
+    @dataclass
+    class PubSubState:
+        desired_subscriptions: Dict[
+            GlideClientConfiguration.PubSubChannelModes, Set[str]
+        ]
+        actual_subscriptions: Dict[
+            GlideClientConfiguration.PubSubChannelModes, Set[str]
+        ]
+
+    def __init__(
+        self,
+        addresses: List[NodeAddress],
+        use_tls: bool = False,
+        credentials: Optional[ServerCredentials] = None,
+        read_from: ReadFrom = ReadFrom.PRIMARY,
+        request_timeout: Optional[int] = None,
+        reconnect_strategy: Optional[BackoffStrategy] = None,
+        database_id: Optional[int] = None,
+        client_name: Optional[str] = None,
+        protocol: ProtocolVersion = ProtocolVersion.RESP3,
+        pubsub_subscriptions: Optional[PubSubSubscriptions] = None,
+        inflight_requests_limit: Optional[int] = None,
+        client_az: Optional[str] = None,
+        advanced_config: Optional[AdvancedGlideClientConfiguration] = None,
+        lazy_connect: Optional[bool] = None,
+        compression: Optional[CompressionConfiguration] = None,
+        read_only: bool = False,
+        client_side_cache: Optional[ClientSideCache] = None,
+        node_discovery_mode: NodeDiscoveryMode = NodeDiscoveryMode.STANDARD,
+        address_resolver: Optional[Callable[[str, int], Tuple[str, int]]] = None,
+    ):
+        super().__init__(
+            addresses=addresses,
+            use_tls=use_tls,
+            credentials=credentials,
+            read_from=read_from,
+            request_timeout=request_timeout,
+            reconnect_strategy=reconnect_strategy,
+            database_id=database_id,
+            client_name=client_name,
+            protocol=protocol,
+            inflight_requests_limit=inflight_requests_limit,
+            client_az=client_az,
+            advanced_config=advanced_config,
+            lazy_connect=lazy_connect,
+            compression=compression,
+            client_side_cache=client_side_cache,
+            address_resolver=address_resolver,
+        )
+        self.pubsub_subscriptions = pubsub_subscriptions
+        self.read_only = read_only
+        self.node_discovery_mode = node_discovery_mode
+
+    def _create_a_protobuf_conn_request(
+        self, cluster_mode: bool = False
+    ) -> ConnectionRequest:
+        assert cluster_mode is False
+        request = super()._create_a_protobuf_conn_request(cluster_mode)
+
+        # Set read_only mode
+        request.read_only = self.read_only
+
+        # Set node discovery mode
+        request.node_discovery_mode = self.node_discovery_mode.value
+
+        if self.pubsub_subscriptions:
+            if self.protocol == ProtocolVersion.RESP2:
+                raise ConfigurationError(
+                    "PubSub subscriptions require RESP3 protocol, but RESP2 was configured."
+                )
+            if (
+                self.pubsub_subscriptions.context is not None
+                and not self.pubsub_subscriptions.callback
+            ):
+                raise ConfigurationError(
+                    "PubSub subscriptions with a context require a callback function to be configured."
+                )
+            for (
+                channel_type,
+                channels_patterns,
+            ) in self.pubsub_subscriptions.channels_and_patterns.items():
+                entry = request.pubsub_subscriptions.channels_or_patterns_by_type[
+                    int(channel_type)
+                ]
+                for channel_pattern in channels_patterns:
+                    entry.channels_or_patterns.append(str.encode(channel_pattern))
+
+        return request
+
+    def _get_pubsub_callback_and_context(
+        self,
+    ) -> Tuple[Optional[Callable[[PubSubMsg, Any], None]], Any]:
+        if self.pubsub_subscriptions:
+            return self.pubsub_subscriptions.callback, self.pubsub_subscriptions.context
+        return None, None
+
+
+class AdvancedGlideClusterClientConfiguration(AdvancedBaseClientConfiguration):
+    """
+    Represents the advanced configuration settings for a Glide Cluster client.
+
+    Attributes:
+        connection_timeout (Optional[int]): The duration in milliseconds to wait for a TCP/TLS connection to complete.
+            This applies both during initial client creation and any reconnection that may occur during request processing.
+            **Note**: A high connection timeout may lead to prolonged blocking of the entire command pipeline.
+            If not explicitly set, a default value of 2000 milliseconds will be used.
+        tls_config (Optional[TlsAdvancedConfiguration]): The advanced TLS configuration settings.
+            This allows for more granular control of TLS behavior, such as enabling an insecure mode
+            that bypasses certificate validation.
+        refresh_topology_from_initial_nodes (bool): Enables refreshing the cluster topology using only the initial nodes.
+            When this option is enabled, all topology updates (both the periodic checks and on-demand refreshes
+            triggered by topology changes) will query only the initial nodes provided when creating the client, rather than using the internal cluster view.
+        pubsub_reconciliation_interval (Optional[int]): The interval in milliseconds between PubSub subscription
+            reconciliation attempts. The reconciliation process ensures that the client's desired subscriptions
+            match the actual subscriptions on the server.
+    """
+
+    def __init__(
+        self,
+        connection_timeout: Optional[int] = None,
+        tls_config: Optional[TlsAdvancedConfiguration] = None,
+        refresh_topology_from_initial_nodes: bool = False,
+        tcp_nodelay: Optional[bool] = None,
+        pubsub_reconciliation_interval: Optional[int] = None,
+    ):
+        super().__init__(
+            connection_timeout, tls_config, tcp_nodelay, pubsub_reconciliation_interval
+        )
+        self.refresh_topology_from_initial_nodes = refresh_topology_from_initial_nodes
+
+    def _create_a_protobuf_conn_request(
+        self, request: ConnectionRequest
+    ) -> ConnectionRequest:
+        super()._create_a_protobuf_conn_request(request)
+
+        request.refresh_topology_from_initial_nodes = (
+            self.refresh_topology_from_initial_nodes
+        )
+        return request
+
+
+class GlideClusterClientConfiguration(BaseClientConfiguration):
+    """
+    Represents the configuration settings for a Cluster Glide client.
+
+    Attributes:
+        addresses (List[NodeAddress]): DNS Addresses and ports of known nodes in the cluster.
+            The list can be partial, as the client will attempt to map out the cluster and find all nodes.
+            For example::
+
+                [
+                    NodeAddress("sample-address-0001.use1.cache.amazonaws.com", 6379),
+                ]
+
+        use_tls (bool): True if communication with the cluster should use Transport Level Security.
+                For advanced tls configuration, please use `AdvancedGlideClusterClientConfiguration`.
+        credentials (ServerCredentials): Credentials for authentication process.
+                If none are set, the client will not authenticate itself with the server.
+        read_from (ReadFrom): If not set, `PRIMARY` will be used.
+        request_timeout (Optional[int]):  The duration in milliseconds that the client should wait for a request to complete.
+            This duration encompasses sending the request, awaiting for a response from the server, and any required
+            reconnection or retries.
+            If the specified timeout is exceeded for a pending request, it will result in a timeout error. If not explicitly
+            set, a default value of 250 milliseconds will be used.
+        reconnect_strategy (Optional[BackoffStrategy]): Strategy used to determine how and when to reconnect, in case of
+            connection failures.
+            If not set, a default backoff strategy will be used.
+        database_id (Optional[int]): Index of the logical database to connect to.
+        client_name (Optional[str]): Client name to be used for the client. Will be used with CLIENT SETNAME command during
+            connection establishment.
+        protocol (ProtocolVersion): The version of the RESP protocol to communicate with the server.
+        periodic_checks (Union[PeriodicChecksStatus, PeriodicChecksManualInterval]): Configure the periodic topology checks.
+            These checks evaluate changes in the cluster's topology, triggering a slot refresh when detected.
+            Periodic checks ensure a quick and efficient process by querying a limited number of nodes.
+            Defaults to PeriodicChecksStatus.ENABLED_DEFAULT_CONFIGS.
+        pubsub_subscriptions (Optional[GlideClusterClientConfiguration.PubSubSubscriptions]): Pubsub subscriptions to be used
+            for the client.
+            Will be applied via SUBSCRIBE/PSUBSCRIBE/SSUBSCRIBE commands during connection establishment.
+        inflight_requests_limit (Optional[int]): The maximum number of concurrent requests allowed to be in-flight
+            (sent but not yet completed).
+            This limit is used to control the memory usage and prevent the client from overwhelming the server or getting
+            stuck in case of a queue backlog.
+            If not set, a default value will be used.
+        client_az (Optional[str]): Availability Zone of the client.
+            If ReadFrom strategy is AZAffinity, this setting ensures that readonly commands are directed to replicas within
+            the specified AZ if exits.
+            If ReadFrom strategy is AZAffinityReplicasAndPrimary, this setting ensures that readonly commands are directed to
+            nodes (first replicas then primary) within the specified AZ if they exist.
+        advanced_config (Optional[AdvancedGlideClusterClientConfiguration]) : Advanced configuration settings for the client,
+            see `AdvancedGlideClusterClientConfiguration`.
+        compression (Optional[CompressionConfiguration]): Configuration for automatic compression of values.
+            When enabled, the client will automatically compress values for set-type commands and decompress
+            values for get-type commands. This can reduce bandwidth usage and storage requirements.
+            If not set, compression is disabled.
+        client_side_cache (Optional[ClientSideCache]): Configuration for client-side caching.
+            See `ClientSideCache` for caching behavior details, supported commands, and expiration semantics.
+
+            In order for 2 clients to share the same cache, they must be
+            created with the same ``ClientSideCache`` instance.
+
+            - Clients with different ``ClientSideCache`` instances will have separate caches,
+              even if the configurations are identical.
+            - Clients using different DBs cannot share the same cache.
+            - Clients using different ACL users cannot share the same cache.
+
+    Note:
+        Currently, the reconnection strategy in cluster mode is not configurable, and exponential backoff
+        with fixed values is used.
+    """
+
+    class PubSubChannelModes(IntEnum):
+        """
+        Describes pubsub subsciption modes.
+        See [valkey.io](https://valkey.io/docs/topics/pubsub/) for more details
+        """
+
+        Exact = 0
+        """ Use exact channel names """
+        Pattern = 1
+        """ Use channel name patterns """
+        Sharded = 2
+        """ Use sharded pubsub. Available since Valkey version 7.0. """
+
+    @dataclass
+    class PubSubSubscriptions:
+        """Describes pubsub configuration for cluster mode client.
+
+        Attributes:
+            channels_and_patterns (Dict[GlideClusterClientConfiguration.PubSubChannelModes, Set[str]]):
+                Channels and patterns by modes.
+            callback (Optional[Callable[[PubSubMsg, Any], None]]):
+                Optional callback to accept the incoming messages.
+            context (Any):
+                Arbitrary context to pass to the callback.
+        """
+
+        channels_and_patterns: Dict[
+            GlideClusterClientConfiguration.PubSubChannelModes, Set[str]
+        ]
+        callback: Optional[Callable[[PubSubMsg, Any], None]]
+        context: Any
+
+    @dataclass
+    class PubSubState:
+        desired_subscriptions: Dict[
+            GlideClusterClientConfiguration.PubSubChannelModes, Set[str]
+        ]
+        actual_subscriptions: Dict[
+            GlideClusterClientConfiguration.PubSubChannelModes, Set[str]
+        ]
+
+    def __init__(
+        self,
+        addresses: List[NodeAddress],
+        use_tls: bool = False,
+        credentials: Optional[ServerCredentials] = None,
+        read_from: ReadFrom = ReadFrom.PRIMARY,
+        request_timeout: Optional[int] = None,
+        reconnect_strategy: Optional[BackoffStrategy] = None,
+        database_id: Optional[int] = None,
+        client_name: Optional[str] = None,
+        protocol: ProtocolVersion = ProtocolVersion.RESP3,
+        periodic_checks: Union[
+            PeriodicChecksStatus, PeriodicChecksManualInterval
+        ] = PeriodicChecksStatus.ENABLED_DEFAULT_CONFIGS,
+        pubsub_subscriptions: Optional[PubSubSubscriptions] = None,
+        inflight_requests_limit: Optional[int] = None,
+        client_az: Optional[str] = None,
+        advanced_config: Optional[AdvancedGlideClusterClientConfiguration] = None,
+        lazy_connect: Optional[bool] = None,
+        compression: Optional[CompressionConfiguration] = None,
+        client_side_cache: Optional[ClientSideCache] = None,
+        address_resolver: Optional[Callable[[str, int], Tuple[str, int]]] = None,
+    ):
+        super().__init__(
+            addresses=addresses,
+            use_tls=use_tls,
+            credentials=credentials,
+            read_from=read_from,
+            request_timeout=request_timeout,
+            reconnect_strategy=reconnect_strategy,
+            database_id=database_id,
+            client_name=client_name,
+            protocol=protocol,
+            inflight_requests_limit=inflight_requests_limit,
+            client_az=client_az,
+            advanced_config=advanced_config,
+            lazy_connect=lazy_connect,
+            compression=compression,
+            client_side_cache=client_side_cache,
+            address_resolver=address_resolver,
+        )
+        self.periodic_checks = periodic_checks
+        self.pubsub_subscriptions = pubsub_subscriptions
+
+    def _create_a_protobuf_conn_request(
+        self, cluster_mode: bool = False
+    ) -> ConnectionRequest:
+        assert cluster_mode is True
+        request = super()._create_a_protobuf_conn_request(cluster_mode)
+        if type(self.periodic_checks) is PeriodicChecksManualInterval:
+            request.periodic_checks_manual_interval.duration_in_sec = (
+                self.periodic_checks.duration_in_sec
+            )
+        elif self.periodic_checks == PeriodicChecksStatus.DISABLED:
+            request.periodic_checks_disabled.SetInParent()
+
+        if self.pubsub_subscriptions:
+            if self.protocol == ProtocolVersion.RESP2:
+                raise ConfigurationError(
+                    "PubSub subscriptions require RESP3 protocol, but RESP2 was configured."
+                )
+            if (
+                self.pubsub_subscriptions.context is not None
+                and not self.pubsub_subscriptions.callback
+            ):
+                raise ConfigurationError(
+                    "PubSub subscriptions with a context require a callback function to be configured."
+                )
+            for (
+                channel_type,
+                channels_patterns,
+            ) in self.pubsub_subscriptions.channels_and_patterns.items():
+                entry = request.pubsub_subscriptions.channels_or_patterns_by_type[
+                    int(channel_type)
+                ]
+                for channel_pattern in channels_patterns:
+                    entry.channels_or_patterns.append(str.encode(channel_pattern))
+
+        if self.lazy_connect is not None:
+            request.lazy_connect = self.lazy_connect
+        return request
+
+    def _get_pubsub_callback_and_context(
+        self,
+    ) -> Tuple[Optional[Callable[[PubSubMsg, Any], None]], Any]:
+        if self.pubsub_subscriptions:
+            return self.pubsub_subscriptions.callback, self.pubsub_subscriptions.context
+        return None, None
+
+
+def load_root_certificates_from_file(path: str) -> bytes:
+    """
+    Load PEM-encoded root certificates from a file.
+
+    This is a convenience function for loading custom root certificates from disk
+    to be used with TlsAdvancedConfiguration.
+
+    Args:
+        path (str): The file path to the PEM-encoded certificate file.
+
+    Returns:
+        bytes: The certificate data in PEM format.
+
+    Raises:
+        FileNotFoundError: If the certificate file does not exist.
+        ConfigurationError: If the certificate file is empty.
+
+    Example usage::
+
+        from glide_shared.config import load_root_certificates_from_file, TlsAdvancedConfiguration
+
+        # Load certificates from file
+        certs = load_root_certificates_from_file('/path/to/ca-cert.pem')
+
+        # Use in TLS configuration
+        tls_config = TlsAdvancedConfiguration(root_pem_cacerts=certs)
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Certificate file not found: {path}")
+    except Exception as e:
+        raise ConfigurationError(f"Failed to read certificate file: {e}")
+
+    if len(data) == 0:
+        raise ConfigurationError(f"Certificate file is empty: {path}")
+
+    return data
+
+
+def load_client_certificate_from_file(path: str) -> bytes:
+    """
+    Load PEM-encoded client certificate from a file for mTLS authentication.
+
+    This is a convenience function for loading client certificates from disk
+    to be used with TlsAdvancedConfiguration for mutual TLS (mTLS).
+
+    Args:
+        path (str): The file path to the PEM-encoded client certificate file.
+
+    Returns:
+        bytes: The client certificate data in PEM format.
+
+    Raises:
+        FileNotFoundError: If the certificate file does not exist.
+        ConfigurationError: If the certificate file is empty.
+
+    Example usage::
+
+        from glide_shared.config import (
+            load_client_certificate_from_file,
+            load_client_key_from_file,
+            TlsAdvancedConfiguration
+        )
+
+        # Load client certificate and key from files
+        client_cert = load_client_certificate_from_file('/path/to/client-cert.pem')
+        client_key = load_client_key_from_file('/path/to/client-key.pem')
+
+        # Use in TLS configuration
+        tls_config = TlsAdvancedConfiguration(
+            client_cert_pem=client_cert,
+            client_key_pem=client_key
+        )
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Client certificate file not found: {path}")
+    except Exception as e:
+        raise ConfigurationError(f"Failed to read client certificate file: {e}")
+
+    if len(data) == 0:
+        raise ConfigurationError(f"Client certificate file is empty: {path}")
+
+    return data
+
+
+def load_client_key_from_file(path: str) -> bytes:
+    """
+    Load PEM-encoded client private key from a file for mutual TLS authentication.
+
+    This is a convenience function for loading client private keys from disk
+    to be used with TlsAdvancedConfiguration for mutual TLS (mTLS).
+
+    Args:
+        path (str): The file path to the PEM-encoded client private key file.
+
+    Returns:
+        bytes: The client private key data in PEM format.
+
+    Raises:
+        FileNotFoundError: If the key file does not exist.
+        ConfigurationError: If the key file is empty.
+
+    Example usage::
+
+        from glide_shared.config import (
+            load_client_certificate_from_file,
+            load_client_key_from_file,
+            TlsAdvancedConfiguration
+        )
+
+        # Load client certificate and key from files
+        client_cert = load_client_certificate_from_file('/path/to/client-cert.pem')
+        client_key = load_client_key_from_file('/path/to/client-key.pem')
+
+        # Use in TLS configuration
+        tls_config = TlsAdvancedConfiguration(
+            client_cert_pem=client_cert,
+            client_key_pem=client_key
+        )
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Client key file not found: {path}")
+    except Exception as e:
+        raise ConfigurationError(f"Failed to read client key file: {e}")
+
+    if len(data) == 0:
+        raise ConfigurationError(f"Client key file is empty: {path}")
+
+    return data
