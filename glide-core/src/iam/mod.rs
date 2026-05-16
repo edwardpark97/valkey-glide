@@ -113,10 +113,30 @@ async fn get_signing_identity(
     region: &str,
     service_type: ServiceType,
 ) -> Result<aws_credential_types::Credentials, GlideIAMError> {
-    let config = aws_config::defaults(BehaviorVersion::latest())
-        .region(aws_config::Region::new(region.to_string()))
-        .load()
-        .await;
+    let mut loader = aws_config::defaults(BehaviorVersion::latest())
+        .region(aws_config::Region::new(region.to_string()));
+
+    // Honor an explicit `AWS_ENDPOINT_URL_STS` override when building the
+    // credentials provider. In partitions where AWS does not publish a
+    // separate FIPS STS hostname (e.g. `us-gov-west-1`, where the standard
+    // `sts.us-gov-west-1.amazonaws.com` endpoint is itself FIPS-validated),
+    // the default credential provider's internal STS client otherwise
+    // constructs `sts-fips.<region>.amazonaws.com` whenever
+    // `AWS_USE_FIPS_ENDPOINT=true` is set. That hostname does not resolve,
+    // so credential acquisition hangs and IAM authentication times out.
+    //
+    // The Python SDK (`boto3`) already threads `AWS_ENDPOINT_URL_STS` into
+    // the credentials-provider STS client; this mirrors that behavior for
+    // the Rust SDK loader. The override is only applied to credential
+    // acquisition: SigV4 presigning of the ElastiCache/MemoryDB connect
+    // request happens separately via `aws-sigv4` and is unaffected.
+    if let Ok(sts_endpoint) = std::env::var("AWS_ENDPOINT_URL_STS")
+        && !sts_endpoint.is_empty()
+    {
+        loader = loader.endpoint_url(sts_endpoint);
+    }
+
+    let config = loader.load().await;
 
     let provider = config.credentials_provider().ok_or_else(|| {
         GlideIAMError::CredentialsError("No AWS credentials provider found".into())
@@ -1004,5 +1024,80 @@ mod tests {
         }
 
         // Stop the refresh task
+    }
+
+    /// Regression test for the `AWS_ENDPOINT_URL_STS` override added to
+    /// `get_signing_identity`. In partitions where AWS does not publish a
+    /// separate FIPS STS hostname (e.g. `us-gov-west-1`), the default
+    /// credential provider's internal STS client otherwise constructs a
+    /// non-existent `sts-fips.<region>.amazonaws.com` whenever
+    /// `AWS_USE_FIPS_ENDPOINT=true` is set, and credential acquisition
+    /// hangs.
+    ///
+    /// With static credentials supplied via `AWS_ACCESS_KEY_ID` no STS
+    /// call is actually made, but exercising the loader path with the
+    /// override set proves the new code is plumbed through without
+    /// breaking the happy path. Runtime behavior against a real STS
+    /// endpoint is validated separately against AWS GovCloud.
+    #[tokio::test]
+    #[serial]
+    async fn test_get_signing_identity_honors_aws_endpoint_url_sts() {
+        initialize_test_environment();
+        setup_test_credentials();
+
+        let cluster_name = "test-cluster".to_string();
+        let username = "test-user".to_string();
+        let region = "us-gov-west-1".to_string();
+
+        // A populated AWS_ENDPOINT_URL_STS override must not break credential
+        // acquisition when static credentials are available.
+        unsafe {
+            env::set_var(
+                "AWS_ENDPOINT_URL_STS",
+                "https://sts.us-gov-west-1.amazonaws.com",
+            );
+        }
+
+        let with_override = IAMTokenManager::new(
+            cluster_name.clone(),
+            username.clone(),
+            region.clone(),
+            ServiceType::ElastiCache,
+            None,
+        )
+        .await;
+        assert!(
+            with_override.is_ok(),
+            "IAMTokenManager creation should succeed when AWS_ENDPOINT_URL_STS is set: {:?}",
+            with_override.err(),
+        );
+        let token = with_override.unwrap().get_token().await;
+        assert!(
+            token.starts_with(&format!("{}/", cluster_name)),
+            "token should be generated with override set"
+        );
+
+        // An empty AWS_ENDPOINT_URL_STS must be treated as unset (the override
+        // is guarded by `!sts_endpoint.is_empty()`).
+        unsafe {
+            env::set_var("AWS_ENDPOINT_URL_STS", "");
+        }
+        let with_empty = IAMTokenManager::new(
+            cluster_name.clone(),
+            username.clone(),
+            region.clone(),
+            ServiceType::ElastiCache,
+            None,
+        )
+        .await;
+        assert!(
+            with_empty.is_ok(),
+            "IAMTokenManager creation should succeed when AWS_ENDPOINT_URL_STS is empty: {:?}",
+            with_empty.err(),
+        );
+
+        unsafe {
+            env::remove_var("AWS_ENDPOINT_URL_STS");
+        }
     }
 }
