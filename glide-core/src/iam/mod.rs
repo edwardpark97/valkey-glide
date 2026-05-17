@@ -123,17 +123,22 @@ async fn get_signing_identity(
     // the default credential provider's internal STS client otherwise
     // constructs `sts-fips.<region>.amazonaws.com` whenever
     // `AWS_USE_FIPS_ENDPOINT=true` is set. That hostname does not resolve,
-    // so credential acquisition hangs and IAM authentication times out.
+    // so credential acquisition fails.
     //
     // The Python SDK (`boto3`) already threads `AWS_ENDPOINT_URL_STS` into
     // the credentials-provider STS client; this mirrors that behavior for
-    // the Rust SDK loader. The override is only applied to credential
-    // acquisition: SigV4 presigning of the ElastiCache/MemoryDB connect
-    // request happens separately via `aws-sigv4` and is unaffected.
+    // the Rust SDK loader. We also explicitly disable FIPS on this loader,
+    // because the SDK's endpoint resolver fails fast when a FIPS partition
+    // is requested but the resolved (or user-provided) endpoint is not on
+    // the FIPS-endpoint list. Disabling FIPS here is safe: the override is
+    // scoped to credential acquisition, and SigV4 presigning of the actual
+    // ElastiCache/MemoryDB connect request happens separately via
+    // `aws-sigv4` and is unaffected. The user remains responsible for
+    // pointing `AWS_ENDPOINT_URL_STS` at a FIPS-validated endpoint.
     if let Ok(sts_endpoint) = std::env::var("AWS_ENDPOINT_URL_STS")
         && !sts_endpoint.is_empty()
     {
-        loader = loader.endpoint_url(sts_endpoint);
+        loader = loader.use_fips(false).endpoint_url(sts_endpoint);
     }
 
     let config = loader.load().await;
